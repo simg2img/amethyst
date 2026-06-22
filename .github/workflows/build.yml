@@ -41,8 +41,8 @@ jobs:
           set -euo pipefail
           SHORT_SHA="${CI_SHA:0:7}"
 
-          BASE_VER="$(grep '^version=' module/module.prop | cut -d= -f2)"
-          BASE_VCODE="$(grep '^versionCode=' module/module.prop | cut -d= -f2)"
+          BASE_VER="$(grep '^version=' module/module.prop | cut -d= -f2 | tr -d '\r')"
+          BASE_VCODE="$(grep '^versionCode=' module/module.prop | cut -d= -f2 | tr -d '\r')"
 
           NEW_VER="${BASE_VER} (${CI_RUN}-${SHORT_SHA}-release)"
           NEW_VCODE="${BASE_VCODE}${CI_RUN}"
@@ -54,7 +54,7 @@ jobs:
           cp module/service.sh output/
           cp main/target/aarch64-unknown-linux-gnu/release/daemon output/lib/
 
-          ZIP_NAME="Amethyst-Thermal-v${BASE_VER}+${BASE_VCODE}.zip"
+          ZIP_NAME="Amethyst-Thermal-${BASE_VER}+${BASE_VCODE}.zip"
           (cd output && zip -9 -r "../${ZIP_NAME}" .)
 
           echo "zip_name=${ZIP_NAME}" >> "$GITHUB_ENV"
