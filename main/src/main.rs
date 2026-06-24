@@ -6,10 +6,12 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-fn write_file(path: &str, val: &str) {
-    if let Ok(mut f) = fs::OpenOptions::new().write(true).open(path) {
-        let _ = f.write_all(val.as_bytes());
-    }
+fn write_file(path: &str, val: &str) -> bool {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(val.as_bytes()))
+        .is_ok()
 }
 
 fn read_file<'a>(path: &str, buf: &'a mut [u8]) -> &'a str {
@@ -57,106 +59,330 @@ fn update_prop_status(status: &str) {
     }
 }
 
-fn throttle(disable: bool) {
-    let rc_dirs = ["/system/etc/init", "/vendor/etc/init", "/odm/etc/init"];
-    let mut services: Vec<String> = Vec::new();
+fn set_thermal_zones(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut ok = 0;
+    let mut total = 0;
+    let mut errors = Vec::new();
 
-    for dir in &rc_dirs {
-        let dir_path = Path::new(dir);
-        if !dir_path.is_dir() {
+    let dir = Path::new("/sys/class/thermal/");
+    if !dir.is_dir() {
+        return (0, 0, errors);
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return (0, 0, errors),
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("thermal_zone") {
             continue;
         }
-        if let Ok(entries) = fs::read_dir(dir_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("rc") {
-                    continue;
+
+        total += 1;
+        let zone_path = entry.path();
+        let mode_path = zone_path.join("mode");
+        let _zone_type = read_file(
+            zone_path.join("type").to_str().unwrap_or(""),
+            &mut [0u8; 64],
+        )
+        .to_string();
+
+        if mode_path.exists() {
+            let target = if disable { "disabled" } else { "enabled" };
+            if write_file(mode_path.to_str().unwrap_or(""), target) {
+                std::thread::sleep(Duration::from_millis(50));
+                let mut buf = [0u8; 16];
+                let cur = read_file(mode_path.to_str().unwrap_or(""), &mut buf);
+                if cur.trim() == target {
+                    ok += 1;
+                } else {
+                    errors.push(format!("{} mode verify fail", name_str));
                 }
-                if let Ok(content) = fs::read_to_string(&path) {
-                    for line in content.lines() {
-                        if let Some(svc) = line.strip_prefix("service ") {
-                            if let Some(name) = svc.split_whitespace().next() {
-                                if !name.is_empty()
-                                    && (name.contains("thermal") || name.contains("therm"))
-                                {
-                                    services.push(name.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
+            } else {
+                errors.push(format!("{} mode write fail", name_str));
             }
         }
     }
 
-    for svc in &services {
-        let action = if disable { "stop" } else { "start" };
-        let _ = Command::new("su")
-            .args([
-                "-lp",
-                "2000",
-                "-c",
-                &format!("resetprop -n ctl.{} {}", action, svc),
-            ])
-            .output();
+    (ok, total, errors)
+}
+
+fn set_trip_temps(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut ok = 0;
+    let mut total = 0;
+    let mut errors = Vec::new();
+
+    let dir = Path::new("/sys/class/thermal/");
+    if !dir.is_dir() {
+        return (0, 0, errors);
     }
 
-    if let Ok(entries) = fs::read_dir("/sys/class/thermal/") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if !name_str.starts_with("thermal_zone") {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return (0, 0, errors),
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("thermal_zone") {
+            continue;
+        }
+
+        let zone_path = entry.path();
+        let trip_entries = match fs::read_dir(&zone_path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for trip in trip_entries.flatten() {
+            let trip_name = trip.file_name();
+            let trip_str = trip_name.to_string_lossy();
+            if !trip_str.starts_with("trip_point_") || !trip_str.ends_with("_temp") {
                 continue;
             }
 
-            let zone_path = entry.path();
-            if let Ok(trip_entries) = fs::read_dir(&zone_path) {
-                for trip in trip_entries.flatten() {
-                    let trip_name = trip.file_name();
-                    let trip_str = trip_name.to_string_lossy();
-                    if !trip_str.starts_with("trip_point_") || !trip_str.ends_with("_temp") {
-                        continue;
-                    }
-                    let trip_path = trip.path();
-                    let _ = fs::set_permissions(&trip_path, fs::Permissions::from_mode(0o644));
-                    write_file(
-                        trip_path.to_str().unwrap_or(""),
-                        if disable { "125000" } else { "45000" },
-                    );
-                    let _ = fs::set_permissions(&trip_path, fs::Permissions::from_mode(0o444));
-                }
+            total += 1;
+            let trip_path = trip.path();
+            let trip_path_str = match trip_path.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
 
-                let mode_path = zone_path.join("mode");
-                if mode_path.exists() {
-                    write_file(
-                        mode_path.to_str().unwrap_or(""),
-                        if disable { "disabled" } else { "enabled" },
-                    );
+            let target = if disable { "125000" } else { "45000" };
+
+            let _ = fs::set_permissions(&trip_path, fs::Permissions::from_mode(0o644));
+            if write_file(trip_path_str, target) {
+                let mut buf = [0u8; 16];
+                let cur = read_file(trip_path_str, &mut buf);
+                if cur.trim() == target {
+                    ok += 1;
+                } else {
+                    errors.push(format!("{} verify fail (got {})", trip_str, cur.trim()));
                 }
+            } else {
+                errors.push(format!("{} write fail", trip_str));
             }
+            let _ = fs::set_permissions(&trip_path, fs::Permissions::from_mode(0o444));
         }
     }
 
-    let ppm_content = match fs::read_to_string("/proc/ppm/policy_status") {
-        Ok(c) => c,
-        Err(_) => return,
+    (ok, total, errors)
+}
+
+fn manage_cooling_devices(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut ok = 0;
+    let mut total = 0;
+    let mut errors = Vec::new();
+
+    let dir = Path::new("/sys/class/thermal/");
+    if !dir.is_dir() {
+        return (0, 0, errors);
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return (0, 0, errors),
     };
 
-    for line in ppm_content.lines() {
-        if line.contains("PPM_POLICY_PWR_THRO") || line.contains("PPM_POLICY_THERMAL") {
-            if let Some(ob) = line.find('[') {
-                if let Some(cb) = line[ob..].find(']') {
-                    let idx = &line[ob + 1..ob + cb];
-                    if let Ok(mut f) =
-                        fs::OpenOptions::new().write(true).open("/proc/ppm/policy_status")
-                    {
-                        let cmd = format!("{} {}\n", idx, if disable { 0 } else { 1 });
-                        let _ = f.write_all(cmd.as_bytes());
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("cooling_device") {
+            continue;
+        }
+
+        total += 1;
+        let dev_path = entry.path();
+        let cur_path = dev_path.join("cur_state");
+        let max_path = dev_path.join("max_state");
+        let _dev_type = read_file(
+            dev_path.join("type").to_str().unwrap_or(""),
+            &mut [0u8; 64],
+        )
+        .to_string();
+
+        if cur_path.exists() {
+            let target = if disable {
+                let mut buf = [0u8; 16];
+                let max_str = read_file(max_path.to_str().unwrap_or(""), &mut buf);
+                max_str.trim().to_string()
+            } else {
+                "0".to_string()
+            };
+
+            if write_file(cur_path.to_str().unwrap_or(""), &target) {
+                let mut buf = [0u8; 16];
+                let cur = read_file(cur_path.to_str().unwrap_or(""), &mut buf);
+                if cur.trim() == target.trim() {
+                    ok += 1;
+                } else {
+                    errors.push(format!("{} cur_state verify fail", name_str));
+                }
+            } else {
+                errors.push(format!("{} cur_state write fail", name_str));
+            }
+        }
+    }
+
+    (ok, total, errors)
+}
+
+fn manage_thermal_services(disable: bool) -> Vec<String> {
+    let known = [
+        "thermal",
+        "thermald",
+        "thermal_manager",
+        "thermal-engine",
+        "vendor.thermal-hal-2-0",
+        "vendor.thermal-hal-2-0.mtk",
+        "vendor.thermal-hal-1-0",
+        "vendor.thermal-hal-1-1",
+        "vendor.thermal-hal-1-2",
+        "vendor.thermal-hal-1-3",
+        "vendor.thermal-hal-1-4",
+        "power-hal",
+        "power_hal",
+    ];
+
+    let mut results = Vec::new();
+
+    for svc in &known {
+        let action = if disable { "stop" } else { "start" };
+        let out = Command::new("resetprop")
+            .args(["-n", &format!("ctl.{}", action), svc])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                results.push(format!("{}:{}", action, svc));
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+
+    results
+}
+
+fn manage_mtk_ppm(disable: bool) -> (usize, usize, Vec<String>) {
+    let ppm_path = "/proc/ppm/policy_status";
+    let content = match fs::read_to_string(ppm_path) {
+        Ok(c) => c,
+        Err(_) => return (0, 0, Vec::new()),
+    };
+
+    let mut ok = 0;
+    let mut total = 0;
+    let mut errors = Vec::new();
+    let val = if disable { 0u32 } else { 1 };
+
+    for line in content.lines() {
+        let is_thermal = line.contains("PPM_POLICY_PWR_THRO")
+            || line.contains("PPM_POLICY_THERMAL");
+        let is_force = line.contains("PPM_POLICY_FORCE_LIMIT");
+        let is_dlpt = line.contains("PPM_POLICY_DLPT");
+
+        if !is_thermal && !is_force && !is_dlpt {
+            continue;
+        }
+
+        total += 1;
+        if let Some(ob) = line.find('[') {
+            if let Some(cb) = line[ob..].find(']') {
+                let idx = &line[ob + 1..ob + cb];
+                if let Ok(mut f) = fs::OpenOptions::new().write(true).open(ppm_path) {
+                    let cmd = format!("{} {}\n", idx, if is_thermal { val } else { 1u32 });
+                    if f.write_all(cmd.as_bytes()).is_ok() {
+                        ok += 1;
+                    } else {
+                        errors.push(format!("ppm policy {} write fail", idx));
                     }
                 }
             }
         }
     }
+
+    (ok, total, errors)
+}
+
+fn manage_mtk_legacy(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut ok = 0;
+    let mut total = 0;
+    let mut errors = Vec::new();
+
+    let paths = [
+        "/sys/devices/virtual/thermal/thermal_message/cpu_limits",
+        "/sys/kernel/fpsgo/fbt/thrm_limit_cpu",
+        "/sys/kernel/fpsgo/fbt/thrm_temp_th",
+    ];
+
+    for p in &paths {
+        let path = Path::new(p);
+        if path.exists() {
+            total += 1;
+            if disable {
+                if write_file(p, "2000000") {
+                    ok += 1;
+                } else {
+                    errors.push(format!("{} write fail", p));
+                }
+            } else {
+                if write_file(p, "0") {
+                    ok += 1;
+                } else {
+                    errors.push(format!("{} restore fail", p));
+                }
+            }
+        }
+    }
+
+    (ok, total, errors)
+}
+
+fn throttle(disable: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let (z_ok, z_total, z_err) = set_thermal_zones(disable);
+    parts.push(format!("zones:{}/{}", z_ok, z_total));
+
+    let (t_ok, t_total, t_err) = set_trip_temps(disable);
+    parts.push(format!("trips:{}/{}", t_ok, t_total));
+
+    let (c_ok, c_total, c_err) = manage_cooling_devices(disable);
+    parts.push(format!("cool:{}/{}", c_ok, c_total));
+
+    let svc_list = manage_thermal_services(disable);
+    parts.push(format!("svc:{}", svc_list.len()));
+
+    let (p_ok, p_total, p_err) = manage_mtk_ppm(disable);
+    if p_total > 0 {
+        parts.push(format!("ppm:{}/{}", p_ok, p_total));
+    }
+
+    let (l_ok, l_total, l_err) = manage_mtk_legacy(disable);
+    if l_total > 0 {
+        parts.push(format!("legacy:{}/{}", l_ok, l_total));
+    }
+
+    let all_errors: Vec<&str> = z_err
+        .iter()
+        .chain(t_err.iter())
+        .chain(c_err.iter())
+        .chain(p_err.iter())
+        .chain(l_err.iter())
+        .map(|s| s.as_str())
+        .collect();
+
+    if all_errors.is_empty() {
+        parts.push("ok".to_string());
+    } else {
+        parts.push(format!("err:{}", all_errors.len()));
+    }
+
+    parts.join(" ")
 }
 
 fn main() {
@@ -221,10 +447,18 @@ fn main() {
         let is_perf_mode = governor == "performance";
 
         if is_perf_mode && !was_perf_mode {
-            throttle(true);
+            let report = throttle(true);
+            update_prop_status(&format!(
+                "\u{2705}block {}",
+                report
+            ));
             was_perf_mode = true;
         } else if !is_perf_mode && was_perf_mode {
-            throttle(false);
+            let report = throttle(false);
+            update_prop_status(&format!(
+                "\u{2705}unblock {}",
+                report
+            ));
             was_perf_mode = false;
         }
 
