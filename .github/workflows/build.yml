@@ -54,18 +54,16 @@ jobs:
           cp module/service.sh output/
           cp main/target/aarch64-unknown-linux-gnu/release/daemon output/lib/
 
-          ZIP_NAME="Amethyst-Thermal-${BASE_VER}+${BASE_VCODE}.zip"
-          (cd output && zip -9 -r "../${ZIP_NAME}" .)
-
-          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_ENV"
+          echo "version_tag=${BASE_VER}+${BASE_VCODE}" >> "$GITHUB_ENV"
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.zip_name }}
-          path: ${{ github.workspace }}/${{ env.zip_name }}
+          name: Amethyst-Thermal-${{ env.version_tag }}
+          path: ${{ github.workspace }}/output/
           if-no-files-found: error
           compression-level: 0
+          overwrite: true
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4

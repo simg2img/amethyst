@@ -1,1 +1,2 @@
-chmod 777 $MODPATH/lib/daemon
+#!/system/bin/sh
+chmod 755 "$MODPATH/lib/daemon"
