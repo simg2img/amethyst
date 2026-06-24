@@ -53,12 +53,14 @@ fn update_prop_status(status: &str) {
             .find('\n')
             .map(|i| eq + i)
             .unwrap_or(content.len());
+
         let new_desc = format!(
-            "description=[{}] A lightweight thermal disabler for Android",
+            "description= {} | A lightweight thermal disabler for Android",
             status
         );
 
-        let mut new_content = String::with_capacity(content.len() + 64);
+        let mut new_content = String::with_capacity(content.len() + 128);
+
         new_content.push_str(&content[..pos]);
         new_content.push_str(&new_desc);
         new_content.push_str(&content[end..]);
@@ -646,99 +648,49 @@ fn manage_exynos_tmu(disable: bool) -> (usize, usize, Vec<String>) {
 }
 
 fn throttle(disable: bool) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    let mut total_ok: usize = 0;
+    let mut total_all: usize = 0;
+    let mut err_count: usize = 0;
 
-    let (z_ok, z_total, z_err) = set_thermal_zones(disable);
-    parts.push(format!("z:{}/{}", z_ok, z_total));
+    let mut collect = |(ok, all, errs): (usize, usize, Vec<String>)| {
+        total_ok += ok;
+        total_all += all;
+        err_count += errs.len();
+    };
 
-    let (t_ok, t_total, t_err) = set_trip_temps(disable);
-    if t_total > 0 {
-        parts.push(format!("tp:{}/{}", t_ok, t_total));
-    }
-
-    let (c_ok, c_total, c_err) = manage_cooling_devices(disable);
-    if c_total > 0 {
-        parts.push(format!("cd:{}/{}", c_ok, c_total));
-    }
-
-    let (m_ok, m_total, m_err) = manage_msm_thermal(disable);
-    if m_total > 0 {
-        parts.push(format!("msm:{}/{}", m_ok, m_total));
-    }
-
-    let (g_ok, g_total, g_err) = manage_gpu_thermal(disable);
-    if g_total > 0 {
-        parts.push(format!("gpu:{}/{}", g_ok, g_total));
-    }
-
-    let (cc_ok, cc_total, cc_err) = manage_core_ctl(disable);
-    if cc_total > 0 {
-        parts.push(format!("cc:{}/{}", cc_ok, cc_total));
-    }
-
-    let (d_ok, d_total, d_err) = manage_devfreq(disable);
-    if d_total > 0 {
-        parts.push(format!("df:{}/{}", d_ok, d_total));
-    }
-
-    let (p_ok, p_total, p_err) = manage_mtk_ppm(disable);
-    if p_total > 0 {
-        parts.push(format!("ppm:{}/{}", p_ok, p_total));
-    }
-
-    let (mt_ok, mt_total, mt_err) = manage_mtk_thermal(disable);
-    if mt_total > 0 {
-        parts.push(format!("mtk:{}/{}", mt_ok, mt_total));
-    }
-
-    let (e_ok, e_total, e_err) = manage_exynos_tmu(disable);
-    if e_total > 0 {
-        parts.push(format!("tmu:{}/{}", e_ok, e_total));
-    }
-
-    let (pf_ok, pf_total, pf_err) = manage_platform_devices(disable);
-    if pf_total > 0 {
-        parts.push(format!("pdev:{}/{}", pf_ok, pf_total));
-    }
-
-    let (mpr_ok, mpr_total, mpr_err) = manage_module_params(disable);
-    if mpr_total > 0 {
-        parts.push(format!("mod:{}/{}", mpr_ok, mpr_total));
-    }
+    collect(set_thermal_zones(disable));
+    collect(set_trip_temps(disable));
+    collect(manage_cooling_devices(disable));
+    collect(manage_msm_thermal(disable));
+    collect(manage_gpu_thermal(disable));
+    collect(manage_core_ctl(disable));
+    collect(manage_devfreq(disable));
+    collect(manage_mtk_ppm(disable));
+    collect(manage_mtk_thermal(disable));
+    collect(manage_exynos_tmu(disable));
+    collect(manage_platform_devices(disable));
+    collect(manage_module_params(disable));
 
     let svc_count = manage_thermal_services(disable);
-    parts.push(format!("svc:{}", svc_count));
 
-    let all_errors: Vec<&str> = z_err
-        .iter()
-        .chain(t_err.iter())
-        .chain(c_err.iter())
-        .chain(m_err.iter())
-        .chain(g_err.iter())
-        .chain(cc_err.iter())
-        .chain(d_err.iter())
-        .chain(p_err.iter())
-        .chain(mt_err.iter())
-        .chain(e_err.iter())
-        .chain(pf_err.iter())
-        .chain(mpr_err.iter())
-        .map(|s| s.as_str())
-        .collect();
-
-    if all_errors.is_empty() {
-        parts.push("ok".to_string());
+    if err_count > 0 {
+        format!(
+            "{}ok{}/{}-{}err{}svc",
+            if total_all > 0 { "" } else { "-" },
+            total_ok, total_all, err_count, svc_count
+        )
+    } else if total_all > 0 {
+        format!("ok{}/{} svc{}", total_ok, total_all, svc_count)
     } else {
-        parts.push(format!("err:{}", all_errors.len()));
+        format!("ok svc{}", svc_count)
     }
-
-    parts.join(" ")
 }
 
 fn main() {
     let child_pid = unsafe { libc::fork() };
 
     if child_pid < 0 {
-        update_prop_status("\u{274c}daemon (fork failed)");
+        update_prop_status(&format!("\u{274c} daemon fork failed"));
         return;
     }
 
@@ -748,16 +700,16 @@ fn main() {
         let mut status: libc::c_int = 0;
         let ret = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
         if ret == child_pid {
-            update_prop_status("\u{274c}daemon (exited)");
+            update_prop_status("\u{274c} daemon exited");
             return;
         }
 
         if unsafe { libc::kill(child_pid, 0) } != 0 {
-            update_prop_status("\u{274c}daemon (died)");
+            update_prop_status("\u{274c} daemon died");
             return;
         }
 
-        update_prop_status(&format!("\u{2705}daemon ({})", child_pid));
+        update_prop_status(&format!("\u{2705} daemon pid {}", child_pid));
         return;
     }
 
@@ -784,10 +736,9 @@ fn main() {
         }
     }
 
-    // Apply immediately on start regardless of governor
     let boot_report = throttle(true);
     update_prop_status(&format!(
-        "\u{2705}active {}",
+        "\u{2705} active {}",
         boot_report
     ));
 
@@ -804,11 +755,11 @@ fn main() {
 
         if is_perf && !was_perf_mode {
             let r = throttle(true);
-            update_prop_status(&format!("\u{2705}block {}", r));
+            update_prop_status(&format!("\u{2705} kill {}", r));
             was_perf_mode = true;
         } else if !is_perf && was_perf_mode {
             let r = throttle(false);
-            update_prop_status(&format!("\u{2705}unblock {}", r));
+            update_prop_status(&format!("\u{2705} restore {}", r));
             was_perf_mode = false;
         }
     }
