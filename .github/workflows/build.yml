@@ -62,7 +62,7 @@ jobs:
           name: Amethyst-Thermal-${{ env.version_tag }}
           path: ${{ github.workspace }}/output/
           if-no-files-found: error
-          compression-level: 0
+          compression-level: 9
           overwrite: true
 
       - name: Upload binary artifact
