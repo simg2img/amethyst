@@ -7,6 +7,9 @@ use std::process::Command;
 use std::time::Duration;
 
 fn write_file(path: &str, val: &str) -> bool {
+    if !Path::new(path).exists() {
+        return false;
+    }
     fs::OpenOptions::new()
         .write(true)
         .open(path)
@@ -105,7 +108,6 @@ impl Op {
     }
 }
 
-// ── Thermal zones: mode + policy + IPA ──
 fn set_thermal_zones(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
     let target_mode = if disable { "disabled" } else { "enabled" };
@@ -143,7 +145,6 @@ fn set_thermal_zones(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── Trip point temps ──
 fn set_trip_temps(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
     let target = if disable { "125000" } else { "45000" };
@@ -194,7 +195,6 @@ fn set_trip_temps(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── Cooling devices ──
 fn manage_cooling_devices(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
 
@@ -237,7 +237,6 @@ fn manage_cooling_devices(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── Qualcomm msm_thermal module params ──
 fn manage_msm_thermal(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
 
@@ -268,7 +267,6 @@ fn manage_msm_thermal(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── Qualcomm KGSL/GPU thermal ──
 fn manage_gpu_thermal(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
 
@@ -297,7 +295,6 @@ fn manage_gpu_thermal(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── Qualcomm core_ctl ──
 fn manage_core_ctl(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
     let clusters = ["cpu0", "cpu4", "cpu5", "cpu6", "cpu7"];
@@ -317,7 +314,6 @@ fn manage_core_ctl(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── Devfreq devices ──
 fn manage_devfreq(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
     let dir = Path::new("/sys/class/devfreq/");
@@ -347,7 +343,6 @@ fn manage_devfreq(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── MediaTek PPM ──
 fn manage_mtk_ppm(disable: bool) -> (usize, usize, Vec<String>) {
     let content = match fs::read_to_string("/proc/ppm/policy_status") {
         Ok(c) => c,
@@ -379,7 +374,6 @@ fn manage_mtk_ppm(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── MediaTek additional proc/sysfs ──
 fn manage_mtk_thermal(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
 
@@ -392,7 +386,6 @@ fn manage_mtk_thermal(disable: bool) -> (usize, usize, Vec<String>) {
     op.write_noverify("/sys/kernel/fpsgo/fbt/thrm_limit_cpu", "2000000");
     op.write_noverify("/sys/kernel/fpsgo/fbt/thrm_temp_th", "200000");
 
-    // Scan /proc/perfmgr/thermal/ if exists
     let perfmgr = Path::new("/proc/perfmgr/thermal/");
     if perfmgr.is_dir() {
         if let Ok(entries) = fs::read_dir(perfmgr) {
@@ -407,7 +400,6 @@ fn manage_mtk_thermal(disable: bool) -> (usize, usize, Vec<String>) {
         }
     }
 
-    // Scan /proc/mtkcooler/ if exists
     let mtkcooler = Path::new("/proc/mtkcooler/");
     if mtkcooler.is_dir() {
         if let Ok(entries) = fs::read_dir(mtkcooler) {
@@ -419,7 +411,6 @@ fn manage_mtk_thermal(disable: bool) -> (usize, usize, Vec<String>) {
                 };
                 let mut buf = [0u8; 16];
                 let cur = read_file(&ps, &mut buf);
-                // Only write if it looks like a toggle (0 or 1)
                 if cur.trim() == "0" || cur.trim() == "1" {
                     op.write_noverify(&ps, mtk_enable);
                 }
@@ -430,7 +421,6 @@ fn manage_mtk_thermal(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── Scan /sys/module/ for thermal-related params ──
 fn manage_module_params(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
 
@@ -467,7 +457,6 @@ fn manage_module_params(disable: bool) -> (usize, usize, Vec<String>) {
                     None => continue,
                 };
 
-                // Skip known paths handled elsewhere
                 if mod_str == "msm_thermal" {
                     continue;
                 }
@@ -476,12 +465,10 @@ fn manage_module_params(disable: bool) -> (usize, usize, Vec<String>) {
                 let cur = read_file(&ppath, &mut buf);
                 let trimmed = cur.trim();
 
-                // Try to disable: set 0, N, or high value
                 if disable {
                     if trimmed == "Y" || trimmed == "1" || trimmed == "enabled" || trimmed == "true" {
                         op.write(&ppath, "N");
                     } else if trimmed == "0" {
-                        // Already off
                         op.total += 1;
                         op.ok += 1;
                     } else if let Ok(v) = trimmed.parse::<u32>() {
@@ -493,7 +480,6 @@ fn manage_module_params(disable: bool) -> (usize, usize, Vec<String>) {
                         }
                     }
                 } else {
-                    // Restore - try to set back
                     if trimmed == "N" || trimmed == "0" || trimmed == "disabled" || trimmed == "false" {
                         op.write(&ppath, "Y");
                     }
@@ -505,44 +491,38 @@ fn manage_module_params(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── Thermal services (stop/start) ──
 fn manage_thermal_services(disable: bool) -> usize {
-    let known = [
-        "thermal",
-        "thermald",
-        "thermal_manager",
-        "thermal-engine",
-        "thermal-daemon",
-        "themal-daemon",
-        "throttle-daemon",
-        "mi_thermald",
-        "sprd_thermal",
-        "exynos-thermal",
-        "pixel-thermal-logd",
-        "qti-libatd",
-        "vendor.thermal-hal-2-0",
-        "vendor.thermal-hal-2-0.mtk",
-        "vendor.thermal-hal-1-0",
-        "vendor.thermal-hal-1-1",
-        "vendor.thermal-hal-1-2",
-        "vendor.thermal-hal-1-3",
-        "vendor.thermal-hal-1-4",
-        "power-hal",
-        "power_hal",
-        "android.thermal-hal",
-        "thermalservice",
-    ];
-
     let mut count = 0;
 
-    for svc in &known {
-        let action = if disable { "stop" } else { "start" };
-        if let Ok(o) = Command::new("resetprop")
-            .args(["-n", &format!("ctl.{}", action), svc])
-            .output()
-        {
-            if o.status.success() {
-                count += 1;
+    let output = match Command::new("resetprop").output() {
+        Ok(o) => match String::from_utf8(o.stdout) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        },
+        Err(_) => return 0,
+    };
+
+    for line in output.lines() {
+        if !line.contains("running") {
+            continue;
+        }
+        if let Some(pos) = line.find("init.svc.") {
+            let after = &line[pos + "init.svc.".len()..];
+            let svc_name = after.split(|c| c == ']' || c == ':' || c == '[' || c == ' ')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if svc_name.is_empty() || !svc_name.contains("thermal") {
+                continue;
+            }
+            let action = if disable { "stop" } else { "start" };
+            if let Ok(o) = Command::new("resetprop")
+                .args(["-n", &format!("ctl.{}", action), svc_name])
+                .output()
+            {
+                if o.status.success() {
+                    count += 1;
+                }
             }
         }
     }
@@ -550,7 +530,6 @@ fn manage_thermal_services(disable: bool) -> usize {
     count
 }
 
-// ── Platform device scan ──
 fn manage_platform_devices(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
     let dir = Path::new("/sys/devices/platform/");
@@ -574,7 +553,6 @@ fn manage_platform_devices(disable: bool) -> (usize, usize, Vec<String>) {
             continue;
         }
 
-        // Walk dir recursively? No, just check common subdirs
         let dev_path = entry.path();
         for sub in ["mode", "enable", "enabled"].iter() {
             let p = dev_path.join(sub);
@@ -590,7 +568,6 @@ fn manage_platform_devices(disable: bool) -> (usize, usize, Vec<String>) {
             }
         }
 
-        // Also try writing 0 to enable nodes
         let enable_path = dev_path.join("enable");
         if enable_path.exists() {
             let ps = enable_path.to_str().unwrap_or("");
@@ -607,7 +584,6 @@ fn manage_platform_devices(disable: bool) -> (usize, usize, Vec<String>) {
     op.done()
 }
 
-// ── Exynos/Tensor TMU emulation ──
 fn manage_exynos_tmu(disable: bool) -> (usize, usize, Vec<String>) {
     let mut op = Op::new();
     let dev_dir = Path::new("/sys/devices/platform/");
@@ -632,7 +608,6 @@ fn manage_exynos_tmu(disable: bool) -> (usize, usize, Vec<String>) {
                     Some(s) => s,
                     None => continue,
                 };
-                // Writing 0 to emul_temp disables emulation
                 let val = if disable { "0" } else { "-1" };
                 if write_file(ps, val) {
                     op.ok += 1;
