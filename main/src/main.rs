@@ -14,6 +14,16 @@ fn write_file(path: &str, val: &str) -> bool {
         .is_ok()
 }
 
+fn write_verify(path: &str, val: &str) -> bool {
+    if !write_file(path, val) {
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    let mut buf = [0u8; 64];
+    let cur = read_file(path, &mut buf);
+    cur.trim() == val.trim()
+}
+
 fn read_file<'a>(path: &str, buf: &'a mut [u8]) -> &'a str {
     match fs::OpenOptions::new().read(true).open(path) {
         Ok(mut f) => match f.read(buf) {
@@ -59,19 +69,50 @@ fn update_prop_status(status: &str) {
     }
 }
 
-fn set_thermal_zones(disable: bool) -> (usize, usize, Vec<String>) {
-    let mut ok = 0;
-    let mut total = 0;
-    let mut errors = Vec::new();
+struct Op {
+    ok: usize,
+    total: usize,
+    errors: Vec<String>,
+}
 
-    let dir = Path::new("/sys/class/thermal/");
-    if !dir.is_dir() {
-        return (0, 0, errors);
+impl Op {
+    fn new() -> Self {
+        Op { ok: 0, total: 0, errors: Vec::new() }
     }
 
+    fn write(&mut self, path: &str, val: &str) {
+        self.total += 1;
+        if write_verify(path, val) {
+            self.ok += 1;
+        } else {
+            self.errors.push(format!("{} fail", path));
+        }
+    }
+
+    fn write_noverify(&mut self, path: &str, val: &str) {
+        self.total += 1;
+        if write_file(path, val) {
+            self.ok += 1;
+        } else {
+            self.errors.push(format!("{} fail", path));
+        }
+    }
+
+    fn done(self) -> (usize, usize, Vec<String>) {
+        (self.ok, self.total, self.errors)
+    }
+}
+
+// ── Thermal zones: mode + policy + IPA ──
+fn set_thermal_zones(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut op = Op::new();
+    let target_mode = if disable { "disabled" } else { "enabled" };
+    let target_policy = if disable { "user_space" } else { "" };
+
+    let dir = Path::new("/sys/class/thermal/");
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return (0, 0, errors),
+        Err(_) => return op.done(),
     };
 
     for entry in entries.flatten() {
@@ -81,48 +122,34 @@ fn set_thermal_zones(disable: bool) -> (usize, usize, Vec<String>) {
             continue;
         }
 
-        total += 1;
         let zone_path = entry.path();
-        let mode_path = zone_path.join("mode");
-        let _zone_type = read_file(
-            zone_path.join("type").to_str().unwrap_or(""),
-            &mut [0u8; 64],
-        )
-        .to_string();
+        let zpath = |s: &str| zone_path.join(s).to_str().unwrap_or("").to_string();
 
-        if mode_path.exists() {
-            let target = if disable { "disabled" } else { "enabled" };
-            if write_file(mode_path.to_str().unwrap_or(""), target) {
-                std::thread::sleep(Duration::from_millis(50));
-                let mut buf = [0u8; 16];
-                let cur = read_file(mode_path.to_str().unwrap_or(""), &mut buf);
-                if cur.trim() == target {
-                    ok += 1;
-                } else {
-                    errors.push(format!("{} mode verify fail", name_str));
-                }
-            } else {
-                errors.push(format!("{} mode write fail", name_str));
-            }
+        op.write(&zpath("mode"), target_mode);
+
+        if disable {
+            let _ = write_file(&zpath("policy"), target_policy);
+            let _ = write_file(&zpath("sustainable_power"), "50000");
+            let _ = write_file(&zpath("k_po"), "0");
+            let _ = write_file(&zpath("k_pu"), "0");
+            let _ = write_file(&zpath("k_i"), "0");
+            let _ = write_file(&zpath("k_d"), "0");
+            let _ = write_file(&zpath("integral_cutoff"), "0");
         }
     }
 
-    (ok, total, errors)
+    op.done()
 }
 
+// ── Trip point temps ──
 fn set_trip_temps(disable: bool) -> (usize, usize, Vec<String>) {
-    let mut ok = 0;
-    let mut total = 0;
-    let mut errors = Vec::new();
+    let mut op = Op::new();
+    let target = if disable { "125000" } else { "45000" };
 
     let dir = Path::new("/sys/class/thermal/");
-    if !dir.is_dir() {
-        return (0, 0, errors);
-    }
-
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return (0, 0, errors),
+        Err(_) => return op.done(),
     };
 
     for entry in entries.flatten() {
@@ -145,47 +172,34 @@ fn set_trip_temps(disable: bool) -> (usize, usize, Vec<String>) {
                 continue;
             }
 
-            total += 1;
             let trip_path = trip.path();
             let trip_path_str = match trip_path.to_str() {
                 Some(s) => s,
                 None => continue,
             };
 
-            let target = if disable { "125000" } else { "45000" };
-
             let _ = fs::set_permissions(&trip_path, fs::Permissions::from_mode(0o644));
-            if write_file(trip_path_str, target) {
-                let mut buf = [0u8; 16];
-                let cur = read_file(trip_path_str, &mut buf);
-                if cur.trim() == target {
-                    ok += 1;
-                } else {
-                    errors.push(format!("{} verify fail (got {})", trip_str, cur.trim()));
-                }
+            if write_verify(trip_path_str, target) {
+                op.ok += 1;
             } else {
-                errors.push(format!("{} write fail", trip_str));
+                op.errors.push(format!("{} fail", trip_str));
             }
+            op.total += 1;
             let _ = fs::set_permissions(&trip_path, fs::Permissions::from_mode(0o444));
         }
     }
 
-    (ok, total, errors)
+    op.done()
 }
 
+// ── Cooling devices ──
 fn manage_cooling_devices(disable: bool) -> (usize, usize, Vec<String>) {
-    let mut ok = 0;
-    let mut total = 0;
-    let mut errors = Vec::new();
+    let mut op = Op::new();
 
     let dir = Path::new("/sys/class/thermal/");
-    if !dir.is_dir() {
-        return (0, 0, errors);
-    }
-
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return (0, 0, errors),
+        Err(_) => return op.done(),
     };
 
     for entry in entries.flatten() {
@@ -195,48 +209,315 @@ fn manage_cooling_devices(disable: bool) -> (usize, usize, Vec<String>) {
             continue;
         }
 
-        total += 1;
         let dev_path = entry.path();
         let cur_path = dev_path.join("cur_state");
         let max_path = dev_path.join("max_state");
-        let _dev_type = read_file(
-            dev_path.join("type").to_str().unwrap_or(""),
-            &mut [0u8; 64],
-        )
-        .to_string();
+        let cpath = |s: &str| dev_path.join(s).to_str().unwrap_or("").to_string();
 
-        if cur_path.exists() {
-            let target = if disable {
-                let mut buf = [0u8; 16];
-                let max_str = read_file(max_path.to_str().unwrap_or(""), &mut buf);
-                max_str.trim().to_string()
-            } else {
-                "0".to_string()
-            };
+        if !cur_path.exists() {
+            continue;
+        }
 
-            if write_file(cur_path.to_str().unwrap_or(""), &target) {
-                let mut buf = [0u8; 16];
-                let cur = read_file(cur_path.to_str().unwrap_or(""), &mut buf);
-                if cur.trim() == target.trim() {
-                    ok += 1;
-                } else {
-                    errors.push(format!("{} cur_state verify fail", name_str));
-                }
-            } else {
-                errors.push(format!("{} cur_state write fail", name_str));
+        let val = if disable {
+            let mut buf = [0u8; 16];
+            read_file(max_path.to_str().unwrap_or(""), &mut buf).trim().to_string()
+        } else {
+            "0".to_string()
+        };
+
+        if val.is_empty() || val == "0" {
+            op.write(&cpath("cur_state"), "0");
+        } else {
+            op.write(&cpath("cur_state"), &val);
+        }
+    }
+
+    op.done()
+}
+
+// ── Qualcomm msm_thermal module params ──
+fn manage_msm_thermal(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut op = Op::new();
+
+    if disable {
+        op.write("/sys/module/msm_thermal/parameters/enabled", "N");
+        op.write("/sys/module/msm_thermal/parameters/core_control_enabled", "0");
+        op.write("/sys/module/msm_thermal/parameters/freq_mitigation_enabled", "0");
+        op.write("/sys/module/msm_thermal/parameters/vdd_restriction_enabled", "0");
+        op.write("/sys/module/msm_thermal/parameters/mx_restriction_enabled", "0");
+        op.write("/sys/module/msm_thermal/parameters/limit_temp_degC", "150");
+        op.write("/sys/module/msm_thermal/parameters/therm_reset_temp_degC", "150");
+        op.write("/sys/module/msm_thermal/parameters/poll_ms", "0");
+        op.write("/sys/module/msm_thermal/parameters/temp_hysteresis_degC", "0");
+        op.write("/sys/module/msm_thermal/parameters/freq_step", "0");
+    } else {
+        op.write("/sys/module/msm_thermal/parameters/enabled", "Y");
+        op.write("/sys/module/msm_thermal/parameters/core_control_enabled", "1");
+        op.write("/sys/module/msm_thermal/parameters/freq_mitigation_enabled", "1");
+        op.write("/sys/module/msm_thermal/parameters/vdd_restriction_enabled", "1");
+        op.write("/sys/module/msm_thermal/parameters/mx_restriction_enabled", "1");
+        op.write("/sys/module/msm_thermal/parameters/limit_temp_degC", "60");
+        op.write("/sys/module/msm_thermal/parameters/therm_reset_temp_degC", "60");
+        op.write("/sys/module/msm_thermal/parameters/poll_ms", "1000");
+        op.write("/sys/module/msm_thermal/parameters/temp_hysteresis_degC", "5");
+        op.write("/sys/module/msm_thermal/parameters/freq_step", "1");
+    }
+
+    op.done()
+}
+
+// ── Qualcomm KGSL/GPU thermal ──
+fn manage_gpu_thermal(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut op = Op::new();
+
+    let gpu = "/sys/class/kgsl/kgsl-3d0";
+
+    if disable {
+        op.write(&format!("{}/thermal_pwrlevel", gpu), "0");
+        op.write(&format!("{}/max_pwrlevel", gpu), "0");
+        op.write(&format!("{}/throttling", gpu), "0");
+        op.write(&format!("{}/force_rail_on", gpu), "1");
+        op.write(&format!("{}/force_clk_on", gpu), "1");
+        op.write(&format!("{}/force_no_nap", gpu), "1");
+        op.write(&format!("{}/bus_split", gpu), "0");
+        let _ = write_file(&format!("{}/idle_timer", gpu), "10000");
+
+        let _ = write_file("/sys/module/adreno_idler/parameters/adreno_idler_active", "0");
+    } else {
+        op.write(&format!("{}/throttling", gpu), "1");
+        op.write(&format!("{}/force_rail_on", gpu), "0");
+        op.write(&format!("{}/force_clk_on", gpu), "0");
+        op.write(&format!("{}/force_no_nap", gpu), "0");
+        op.write(&format!("{}/bus_split", gpu), "1");
+        let _ = write_file(&format!("{}/thermal_pwrlevel", gpu), "1");
+    }
+
+    op.done()
+}
+
+// ── Qualcomm core_ctl ──
+fn manage_core_ctl(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut op = Op::new();
+    let clusters = ["cpu0", "cpu4", "cpu5", "cpu6", "cpu7"];
+
+    if disable {
+        let _ = write_file("/sys/module/core_ctl/parameters/enable", "N");
+        for c in &clusters {
+            op.write(&format!("/sys/devices/system/cpu/{}/core_ctl/enable", c), "0");
+        }
+    } else {
+        let _ = write_file("/sys/module/core_ctl/parameters/enable", "Y");
+        for c in &clusters {
+            let _ = write_file(&format!("/sys/devices/system/cpu/{}/core_ctl/enable", c), "1");
+        }
+    }
+
+    op.done()
+}
+
+// ── Devfreq devices ──
+fn manage_devfreq(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut op = Op::new();
+    let dir = Path::new("/sys/class/devfreq/");
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return op.done(),
+    };
+
+    for entry in entries.flatten() {
+        let dev_path = entry.path();
+        let dpath = |s: &str| dev_path.join(s).to_str().unwrap_or("").to_string();
+
+        if disable {
+            let _ = write_file(&dpath("governor"), "userspace");
+            let mut buf = [0u8; 32];
+            let cur = read_file(&dpath("cur_freq"), &mut buf);
+            let max = cur.trim();
+            if !max.is_empty() {
+                op.write(&dpath("max_freq"), max);
+            }
+            let _ = write_file(&dpath("polling_interval"), "0");
+        } else {
+            let _ = write_file(&dpath("governor"), "performance");
+        }
+    }
+
+    op.done()
+}
+
+// ── MediaTek PPM ──
+fn manage_mtk_ppm(disable: bool) -> (usize, usize, Vec<String>) {
+    let content = match fs::read_to_string("/proc/ppm/policy_status") {
+        Ok(c) => c,
+        Err(_) => return (0, 0, Vec::new()),
+    };
+
+    let mut op = Op::new();
+    let therm_val = if disable { 0u32 } else { 1 };
+
+    for line in content.lines() {
+        let is_therm = line.contains("PPM_POLICY_PWR_THRO")
+            || line.contains("PPM_POLICY_THERMAL");
+        let is_force = line.contains("PPM_POLICY_FORCE_LIMIT");
+        let is_dlpt = line.contains("PPM_POLICY_DLPT");
+
+        if !is_therm && !is_force && !is_dlpt {
+            continue;
+        }
+
+        if let Some(ob) = line.find('[') {
+            if let Some(cb) = line[ob..].find(']') {
+                let idx = &line[ob + 1..ob + cb];
+                let cmd = format!("{} {}\n", idx, if is_therm { therm_val } else { 1u32 });
+                op.write_noverify("/proc/ppm/policy_status", &cmd);
             }
         }
     }
 
-    (ok, total, errors)
+    op.done()
 }
 
-fn manage_thermal_services(disable: bool) -> Vec<String> {
+// ── MediaTek additional proc/sysfs ──
+fn manage_mtk_thermal(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut op = Op::new();
+
+    let mtk_enable = if disable { "0" } else { "1" };
+    let mtk_high = if disable { "2000000" } else { "0" };
+
+    op.write_noverify("/proc/driver/mtk_thermal_monitor", mtk_enable);
+    op.write_noverify("/proc/cpufreq/cpufreq_power_cap", mtk_high);
+    op.write_noverify("/sys/devices/virtual/thermal/thermal_message/cpu_limits", "cpu0 2000000");
+    op.write_noverify("/sys/kernel/fpsgo/fbt/thrm_limit_cpu", "2000000");
+    op.write_noverify("/sys/kernel/fpsgo/fbt/thrm_temp_th", "200000");
+
+    // Scan /proc/perfmgr/thermal/ if exists
+    let perfmgr = Path::new("/proc/perfmgr/thermal/");
+    if perfmgr.is_dir() {
+        if let Ok(entries) = fs::read_dir(perfmgr) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let ps = match p.to_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                op.write_noverify(&ps, mtk_enable);
+            }
+        }
+    }
+
+    // Scan /proc/mtkcooler/ if exists
+    let mtkcooler = Path::new("/proc/mtkcooler/");
+    if mtkcooler.is_dir() {
+        if let Ok(entries) = fs::read_dir(mtkcooler) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let ps = match p.to_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let mut buf = [0u8; 16];
+                let cur = read_file(&ps, &mut buf);
+                // Only write if it looks like a toggle (0 or 1)
+                if cur.trim() == "0" || cur.trim() == "1" {
+                    op.write_noverify(&ps, mtk_enable);
+                }
+            }
+        }
+    }
+
+    op.done()
+}
+
+// ── Scan /sys/module/ for thermal-related params ──
+fn manage_module_params(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut op = Op::new();
+
+    let mod_dir = Path::new("/sys/module/");
+    let entries = match fs::read_dir(mod_dir) {
+        Ok(e) => e,
+        Err(_) => return op.done(),
+    };
+
+    for entry in entries.flatten() {
+        let mod_name = entry.file_name();
+        let mod_str = mod_name.to_string_lossy();
+        let is_thermal = mod_str.contains("thermal")
+            || mod_str.contains("therm")
+            || mod_str.contains("cooling")
+            || mod_str == "core_ctl"
+            || mod_str == "adreno_idler";
+
+        if !is_thermal {
+            continue;
+        }
+
+        let params_dir = entry.path().join("parameters");
+        if !params_dir.is_dir() {
+            continue;
+        }
+
+        if let Ok(params) = fs::read_dir(&params_dir) {
+            for param in params.flatten() {
+                let pname = param.file_name();
+                let _pstr = pname.to_string_lossy();
+                let ppath = match param.path().to_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+
+                // Skip known paths handled elsewhere
+                if mod_str == "msm_thermal" {
+                    continue;
+                }
+
+                let mut buf = [0u8; 32];
+                let cur = read_file(&ppath, &mut buf);
+                let trimmed = cur.trim();
+
+                // Try to disable: set 0, N, or high value
+                if disable {
+                    if trimmed == "Y" || trimmed == "1" || trimmed == "enabled" || trimmed == "true" {
+                        op.write(&ppath, "N");
+                    } else if trimmed == "0" {
+                        // Already off
+                        op.total += 1;
+                        op.ok += 1;
+                    } else if let Ok(v) = trimmed.parse::<u32>() {
+                        if v > 0 && v < 10000 {
+                            op.write(&ppath, "0");
+                        } else {
+                            op.total += 1;
+                            op.ok += 1;
+                        }
+                    }
+                } else {
+                    // Restore - try to set back
+                    if trimmed == "N" || trimmed == "0" || trimmed == "disabled" || trimmed == "false" {
+                        op.write(&ppath, "Y");
+                    }
+                }
+            }
+        }
+    }
+
+    op.done()
+}
+
+// ── Thermal services (stop/start) ──
+fn manage_thermal_services(disable: bool) -> usize {
     let known = [
         "thermal",
         "thermald",
         "thermal_manager",
         "thermal-engine",
+        "thermal-daemon",
+        "themal-daemon",
+        "throttle-daemon",
+        "mi_thermald",
+        "sprd_thermal",
+        "exynos-thermal",
+        "pixel-thermal-logd",
+        "qti-libatd",
         "vendor.thermal-hal-2-0",
         "vendor.thermal-hal-2-0.mtk",
         "vendor.thermal-hal-1-0",
@@ -246,133 +527,201 @@ fn manage_thermal_services(disable: bool) -> Vec<String> {
         "vendor.thermal-hal-1-4",
         "power-hal",
         "power_hal",
+        "android.thermal-hal",
+        "thermalservice",
     ];
 
-    let mut results = Vec::new();
+    let mut count = 0;
 
     for svc in &known {
         let action = if disable { "stop" } else { "start" };
-        let out = Command::new("resetprop")
+        if let Ok(o) = Command::new("resetprop")
             .args(["-n", &format!("ctl.{}", action), svc])
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-                results.push(format!("{}:{}", action, svc));
+            .output()
+        {
+            if o.status.success() {
+                count += 1;
             }
-            Ok(_) => {}
-            Err(_) => {}
         }
     }
 
-    results
+    count
 }
 
-fn manage_mtk_ppm(disable: bool) -> (usize, usize, Vec<String>) {
-    let ppm_path = "/proc/ppm/policy_status";
-    let content = match fs::read_to_string(ppm_path) {
-        Ok(c) => c,
-        Err(_) => return (0, 0, Vec::new()),
+// ── Platform device scan ──
+fn manage_platform_devices(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut op = Op::new();
+    let dir = Path::new("/sys/devices/platform/");
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return op.done(),
     };
 
-    let mut ok = 0;
-    let mut total = 0;
-    let mut errors = Vec::new();
-    let val = if disable { 0u32 } else { 1 };
+    for entry in entries.flatten() {
+        let dev_name = entry.file_name();
+        let dev_str = dev_name.to_string_lossy();
 
-    for line in content.lines() {
-        let is_thermal = line.contains("PPM_POLICY_PWR_THRO")
-            || line.contains("PPM_POLICY_THERMAL");
-        let is_force = line.contains("PPM_POLICY_FORCE_LIMIT");
-        let is_dlpt = line.contains("PPM_POLICY_DLPT");
+        let is_therm = dev_str.contains("thermal")
+            || dev_str.contains("tmu")
+            || dev_str.contains("therm")
+            || dev_str == "bcl"
+            || dev_str.starts_with("qcom,bcl")
+            || dev_str.starts_with("sprd-thermal");
 
-        if !is_thermal && !is_force && !is_dlpt {
+        if !is_therm {
             continue;
         }
 
-        total += 1;
-        if let Some(ob) = line.find('[') {
-            if let Some(cb) = line[ob..].find(']') {
-                let idx = &line[ob + 1..ob + cb];
-                if let Ok(mut f) = fs::OpenOptions::new().write(true).open(ppm_path) {
-                    let cmd = format!("{} {}\n", idx, if is_thermal { val } else { 1u32 });
-                    if f.write_all(cmd.as_bytes()).is_ok() {
-                        ok += 1;
-                    } else {
-                        errors.push(format!("ppm policy {} write fail", idx));
-                    }
+        // Walk dir recursively? No, just check common subdirs
+        let dev_path = entry.path();
+        for sub in ["mode", "enable", "enabled"].iter() {
+            let p = dev_path.join(sub);
+            if p.exists() {
+                let ps = p.to_str().unwrap_or("");
+                let val = if disable { "disabled" } else { "enabled" };
+                if write_verify(ps, val) {
+                    op.ok += 1;
+                } else {
+                    op.errors.push(format!("{} fail", ps));
                 }
+                op.total += 1;
             }
+        }
+
+        // Also try writing 0 to enable nodes
+        let enable_path = dev_path.join("enable");
+        if enable_path.exists() {
+            let ps = enable_path.to_str().unwrap_or("");
+            let val = if disable { "0" } else { "1" };
+            if write_verify(ps, val) {
+                op.ok += 1;
+            } else {
+                op.errors.push(format!("{} fail", ps));
+            }
+            op.total += 1;
         }
     }
 
-    (ok, total, errors)
+    op.done()
 }
 
-fn manage_mtk_legacy(disable: bool) -> (usize, usize, Vec<String>) {
-    let mut ok = 0;
-    let mut total = 0;
-    let mut errors = Vec::new();
+// ── Exynos/Tensor TMU emulation ──
+fn manage_exynos_tmu(disable: bool) -> (usize, usize, Vec<String>) {
+    let mut op = Op::new();
+    let dev_dir = Path::new("/sys/devices/platform/");
+    let entries = match fs::read_dir(dev_dir) {
+        Ok(e) => e,
+        Err(_) => return op.done(),
+    };
 
-    let paths = [
-        "/sys/devices/virtual/thermal/thermal_message/cpu_limits",
-        "/sys/kernel/fpsgo/fbt/thrm_limit_cpu",
-        "/sys/kernel/fpsgo/fbt/thrm_temp_th",
-    ];
+    for entry in entries.flatten() {
+        let dev_name = entry.file_name();
+        let dev_str = dev_name.to_string_lossy();
 
-    for p in &paths {
-        let path = Path::new(p);
-        if path.exists() {
-            total += 1;
-            if disable {
-                if write_file(p, "2000000") {
-                    ok += 1;
+        if !dev_str.contains("tmu") && !dev_str.contains("TMU") {
+            continue;
+        }
+
+        let dev_path = entry.path();
+        for sub in ["emulation", "emul_temp"] {
+            let p = dev_path.join(sub);
+            if p.exists() {
+                let ps = match p.to_str() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                // Writing 0 to emul_temp disables emulation
+                let val = if disable { "0" } else { "-1" };
+                if write_file(ps, val) {
+                    op.ok += 1;
                 } else {
-                    errors.push(format!("{} write fail", p));
+                    op.errors.push(format!("{} fail", ps));
                 }
-            } else {
-                if write_file(p, "0") {
-                    ok += 1;
-                } else {
-                    errors.push(format!("{} restore fail", p));
-                }
+                op.total += 1;
             }
         }
     }
 
-    (ok, total, errors)
+    op.done()
 }
 
 fn throttle(disable: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     let (z_ok, z_total, z_err) = set_thermal_zones(disable);
-    parts.push(format!("zones:{}/{}", z_ok, z_total));
+    parts.push(format!("z:{}/{}", z_ok, z_total));
 
     let (t_ok, t_total, t_err) = set_trip_temps(disable);
-    parts.push(format!("trips:{}/{}", t_ok, t_total));
+    if t_total > 0 {
+        parts.push(format!("tp:{}/{}", t_ok, t_total));
+    }
 
     let (c_ok, c_total, c_err) = manage_cooling_devices(disable);
-    parts.push(format!("cool:{}/{}", c_ok, c_total));
+    if c_total > 0 {
+        parts.push(format!("cd:{}/{}", c_ok, c_total));
+    }
 
-    let svc_list = manage_thermal_services(disable);
-    parts.push(format!("svc:{}", svc_list.len()));
+    let (m_ok, m_total, m_err) = manage_msm_thermal(disable);
+    if m_total > 0 {
+        parts.push(format!("msm:{}/{}", m_ok, m_total));
+    }
+
+    let (g_ok, g_total, g_err) = manage_gpu_thermal(disable);
+    if g_total > 0 {
+        parts.push(format!("gpu:{}/{}", g_ok, g_total));
+    }
+
+    let (cc_ok, cc_total, cc_err) = manage_core_ctl(disable);
+    if cc_total > 0 {
+        parts.push(format!("cc:{}/{}", cc_ok, cc_total));
+    }
+
+    let (d_ok, d_total, d_err) = manage_devfreq(disable);
+    if d_total > 0 {
+        parts.push(format!("df:{}/{}", d_ok, d_total));
+    }
 
     let (p_ok, p_total, p_err) = manage_mtk_ppm(disable);
     if p_total > 0 {
         parts.push(format!("ppm:{}/{}", p_ok, p_total));
     }
 
-    let (l_ok, l_total, l_err) = manage_mtk_legacy(disable);
-    if l_total > 0 {
-        parts.push(format!("legacy:{}/{}", l_ok, l_total));
+    let (mt_ok, mt_total, mt_err) = manage_mtk_thermal(disable);
+    if mt_total > 0 {
+        parts.push(format!("mtk:{}/{}", mt_ok, mt_total));
     }
+
+    let (e_ok, e_total, e_err) = manage_exynos_tmu(disable);
+    if e_total > 0 {
+        parts.push(format!("tmu:{}/{}", e_ok, e_total));
+    }
+
+    let (pf_ok, pf_total, pf_err) = manage_platform_devices(disable);
+    if pf_total > 0 {
+        parts.push(format!("pdev:{}/{}", pf_ok, pf_total));
+    }
+
+    let (mpr_ok, mpr_total, mpr_err) = manage_module_params(disable);
+    if mpr_total > 0 {
+        parts.push(format!("mod:{}/{}", mpr_ok, mpr_total));
+    }
+
+    let svc_count = manage_thermal_services(disable);
+    parts.push(format!("svc:{}", svc_count));
 
     let all_errors: Vec<&str> = z_err
         .iter()
         .chain(t_err.iter())
         .chain(c_err.iter())
+        .chain(m_err.iter())
+        .chain(g_err.iter())
+        .chain(cc_err.iter())
+        .chain(d_err.iter())
         .chain(p_err.iter())
-        .chain(l_err.iter())
+        .chain(mt_err.iter())
+        .chain(e_err.iter())
+        .chain(pf_err.iter())
+        .chain(mpr_err.iter())
         .map(|s| s.as_str())
         .collect();
 
@@ -435,33 +784,32 @@ fn main() {
         }
     }
 
-    let mut was_perf_mode = false;
+    // Apply immediately on start regardless of governor
+    let boot_report = throttle(true);
+    update_prop_status(&format!(
+        "\u{2705}active {}",
+        boot_report
+    ));
+
+    let mut was_perf_mode = true;
 
     loop {
-        let mut governor_buf = [0u8; 32];
-        let governor = read_file(
+        std::thread::sleep(Duration::from_secs(5));
+        let mut buf = [0u8; 32];
+        let gov = read_file(
             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-            &mut governor_buf,
+            &mut buf,
         );
+        let is_perf = gov == "performance";
 
-        let is_perf_mode = governor == "performance";
-
-        if is_perf_mode && !was_perf_mode {
-            let report = throttle(true);
-            update_prop_status(&format!(
-                "\u{2705}block {}",
-                report
-            ));
+        if is_perf && !was_perf_mode {
+            let r = throttle(true);
+            update_prop_status(&format!("\u{2705}block {}", r));
             was_perf_mode = true;
-        } else if !is_perf_mode && was_perf_mode {
-            let report = throttle(false);
-            update_prop_status(&format!(
-                "\u{2705}unblock {}",
-                report
-            ));
+        } else if !is_perf && was_perf_mode {
+            let r = throttle(false);
+            update_prop_status(&format!("\u{2705}unblock {}", r));
             was_perf_mode = false;
         }
-
-        std::thread::sleep(Duration::from_secs(1));
     }
 }
