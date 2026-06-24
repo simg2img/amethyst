@@ -690,7 +690,7 @@ fn main() {
     let child_pid = unsafe { libc::fork() };
 
     if child_pid < 0 {
-        update_prop_status(&format!("\u{274c} daemon fork failed"));
+        update_prop_status(&format!("\u{274c} daemon (fork failed)"));
         return;
     }
 
@@ -700,16 +700,16 @@ fn main() {
         let mut status: libc::c_int = 0;
         let ret = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
         if ret == child_pid {
-            update_prop_status("\u{274c} daemon exited");
+            update_prop_status("\u{274c} daemon (exited)");
             return;
         }
 
         if unsafe { libc::kill(child_pid, 0) } != 0 {
-            update_prop_status("\u{274c} daemon died");
+            update_prop_status("\u{274c} daemon (died)");
             return;
         }
 
-        update_prop_status(&format!("\u{2705} daemon pid {}", child_pid));
+        update_prop_status(&format!("\u{2705} daemon ({})", child_pid));
         return;
     }
 
@@ -736,11 +736,7 @@ fn main() {
         }
     }
 
-    let boot_report = throttle(true);
-    update_prop_status(&format!(
-        "\u{2705} active {}",
-        boot_report
-    ));
+    let _ = throttle(true);
 
     let mut was_perf_mode = true;
 
@@ -754,12 +750,10 @@ fn main() {
         let is_perf = gov == "performance";
 
         if is_perf && !was_perf_mode {
-            let r = throttle(true);
-            update_prop_status(&format!("\u{2705} kill {}", r));
+            let _ = throttle(true);
             was_perf_mode = true;
         } else if !is_perf && was_perf_mode {
-            let r = throttle(false);
-            update_prop_status(&format!("\u{2705} restore {}", r));
+            let _ = throttle(false);
             was_perf_mode = false;
         }
     }
